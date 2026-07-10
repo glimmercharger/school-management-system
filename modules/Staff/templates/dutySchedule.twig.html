@@ -1,0 +1,106 @@
+{% if duty %}
+<div class="relative w-full" style="height:42rem" >
+<div id="duty" class="absolute dutyContainer overflow-x-auto overflow-y-hidden w-full h-full pb-2 flex flex-row font-sans  whitespace-nowrap" >
+
+    {% for weekdayName, dutyList in duty %}
+        <div class="w-72 mr-2 rounded bg-gray-200 flex flex-col whitespace-nowrap ">
+        <h5 class="mt-0 p-3 text-base font-bold text-gray-800">{{ weekdayName }}</h5>
+
+        <div class="w-72 bg-gray-200 overflow-y-auto overflow-x-hidden flex flex-col gap-4 p-3">
+        {% for dutyItem in dutyList %}
+            <div class="" >
+                <div class="flex justify-between text-sm mb-2">
+                    <span class="text-xs font-medium text-gray-700">{{ dutyItem.name }}</span>
+                    <span class="text-xs text-gray-500">{{ formatUsing('timeRange', dutyItem.timeStart, dutyItem.timeEnd) }}</span>
+                </div>
+
+                <div class="dutySection rounded" style="min-height: 3.2rem;" data-duty="{{ dutyItem.gibbonStaffDutyID }}" data-weekday="{{ dutyItem.gibbonDaysOfWeekID }}">
+
+                {% for person in dutyItem.roster %}
+                <div class="dutyPerson z-10 rounded flex items-center bg-white shadow mb-2 p-2 text-sm border  {% if canEdit %}hover:bg-blue-50 hover:border-blue-500 cursor-move group{% endif %}" data-person="{{ person.gibbonStaffDutyPersonID }}">
+                    <div class="rounded-full w-8 h-8 mr-2 overflow-hidden cursor-move" style="background-image: url('{{ absoluteURL }}/themes/{{ gibbonThemeName }}/img/anonymous_75.jpg'); background-size: cover; background-position: 50% 45%;">
+                        {% if person.image_240 is not empty %}
+                        <img src="{{ absoluteURL }}/{{ person.image_240 }}" class="w-full -mt-1">
+                        {% endif %}
+                    </div>
+
+                    {{ formatUsing('name', person.title, person.preferredName, person.surname, 'Staff', false, true) }}<br/>
+
+                    <div class="flex-1"></div>
+                    {% if canEdit %}
+                    <a href="{{ absoluteURL }}/fullscreen.php?q=/modules/Staff/staff_duty_delete.php&width=650&height=250&gibbonStaffDutyPersonID={{ person.gibbonStaffDutyPersonID }}" class="thickbox text-right hidden group-hover:block cursor-pointer" title="{{ __('Delete') }}">
+                        {{ icon('solid', 'delete', 'size-4 mr-2 mb-1 align-middle') }}
+                    </a>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                </div>
+            </div>
+        {% endfor %}
+        </div>
+
+        {% if canEdit %}
+        <a href="{{ absoluteURL }}/fullscreen.php?q=/modules/Staff/staff_duty_add.php&width=800&height=400&gibbonDaysOfWeekID={{ (dutyList|first).gibbonDaysOfWeekID }}" class="thickbox  bg-gray-200 hover:bg-gray-400 p-2 mx-2 my-2 rounded-lg text-sm font-bold text-gray-700 hover:text-gray-900 flex items-center justify-center">
+            {{ icon('solid', 'add', 'size-4 mr-2') }}
+            {{ __('Add Staff') }}
+        </a>
+        {% endif %}
+        </div>
+    {% endfor %}
+
+</div>
+</div>
+{% else %}
+    <div class="h-48 rounded-sm border bg-gray-100 shadow-inner overflow-hidden">
+        {{ include('components/blankSlate.twig.html') }}
+    </div>
+{% endif %}
+
+{% if canEdit %}
+<script>
+
+
+$('#dutyOuter .dutySection').sortable({
+    tolerance: 5,
+    cursor: "move",
+    items: ".dutyPerson",
+    connectWith: ".dutySection",
+    zIndex: 20,
+    containment: "#dutyOuter",
+    
+});
+
+$('#dutyOuter .dutySection').droppable({
+    accept: '.dutyPerson',
+
+    classes: {
+        "ui-droppable-active": "bg-stripe-overlay"
+    },
+    over: function(event, ui) {
+    },
+    out: function(event, ui) {
+    },
+    deactivate: function(event, ui) {
+    },
+
+    drop: function(event, ui) {
+        $.ajax({
+            url: '{{ absoluteURL }}/modules/Staff/staff_duty_ajaxProcess.php',
+            data: {
+                gibbonStaffDutyPersonID: $(ui.draggable).data('person'),
+                gibbonStaffDutyID: $(this).data('duty'),
+                gibbonDaysOfWeekID: $(this).data('weekday'),
+                csrftoken: "{{ csrftoken }}",
+                nonce: "{{ nonce }}",
+            },
+            type: 'GET',
+            complete: function (data) {
+            },
+            
+        });
+    },
+});
+    
+</script>
+
+{% endif %}
