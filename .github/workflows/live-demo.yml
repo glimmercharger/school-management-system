@@ -1,0 +1,437 @@
+name: Live demo
+
+# Manually triggered ("Run workflow" button in the Actions tab) -- no push
+# needed to get a fresh link. Starting a new run auto-cancels any run
+# already in progress, so re-running this is how you get a new link.
+#
+# Everything the run creates -- the database, the generated config.php, the
+# admin account -- lives and dies with the job. Nothing is committed and
+# nothing outlives the runner.
+on:
+  workflow_dispatch:
+    inputs:
+      duration_minutes:
+        description: "How long to keep the live link up (minutes, capped at 300)"
+        required: false
+        default: "60"
+      demo_data:
+        description: "Load the bundled demo school (students, classes, timetables)"
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: live-demo
+  cancel-in-progress: true
+
+# Least-privilege default: this workflow only reads the repo and talks to
+# services it starts itself -- it never calls the GitHub API.
+permissions:
+  contents: read
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 320
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: gibbon
+          MYSQL_DATABASE: gibbon
+        ports:
+          - 3306:3306
+        # mysqladmin ping answers before the server will accept real queries,
+        # so the health check runs an actual authenticated statement.
+        options: >-
+          --health-cmd "mysql -h 127.0.0.1 -u root -pgibbon -e 'SELECT 1'"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 24
+    env:
+      PHP_VERSION: "8.3"
+      PORT: "8080"
+      GIBBON_DB_HOST: 127.0.0.1
+      GIBBON_DB_NAME: gibbon
+      GIBBON_DB_USER: root
+      GIBBON_DB_PASS: gibbon
+      GIBBON_ADMIN_USERNAME: admin
+      GIBBON_ADMIN_EMAIL: admin@example.invalid
+      GIBBON_TIMEZONE: UTC
+      GIBBON_SUMMARY_FILE: /tmp/gibbon-logins.md
+    steps:
+      # persist-credentials: false because the checkout lands inside a document
+      # root that is about to be published. With the default (true),
+      # actions/checkout writes the job's GITHUB_TOKEN into .git/config as an
+      # http.extraheader, so anyone fetching /.git/config off the tunnel would
+      # get a working credential. Nothing here pushes, so there is nothing to
+      # persist. The vhost denies .git as well -- this is the belt, that is the
+      # braces.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # The PHP version is pinned rather than left to the unversioned
+      # metapackages: runner images carry the ondrej PPA, whose "php-cli" tracks
+      # the newest PHP, and this Gibbon release predates it -- on 8.4 the vendor
+      # tree alone emits hundreds of implicit-nullable deprecations.
+      #
+      # Two package notes. gettext is absent from the list because it ships
+      # inside php-common on Debian and Ubuntu (the "php-gettext" package is an
+      # unrelated userland library). bcmath is present because composer.json
+      # does not mention it but omnipay pulls in moneyphp/money, which requires
+      # it -- without bcmath "composer install" fails outright.
+      - name: Install Apache, PHP and the extensions Gibbon requires
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            apache2 "libapache2-mod-php${PHP_VERSION}" \
+            "php${PHP_VERSION}-cli" "php${PHP_VERSION}-mysql" "php${PHP_VERSION}-intl" \
+            "php${PHP_VERSION}-mbstring" "php${PHP_VERSION}-curl" "php${PHP_VERSION}-gd" \
+            "php${PHP_VERSION}-zip" "php${PHP_VERSION}-xml" "php${PHP_VERSION}-bcmath"
+          sudo update-alternatives --set php "/usr/bin/php${PHP_VERSION}"
+          sudo systemctl stop apache2
+
+      # version.php lists these extensions as system requirements. The web
+      # installer only warns about a missing one; a headless install would fail
+      # much later and far less legibly, so check up front. The version is
+      # asserted too: runner images ship more than one PHP, and if the
+      # alternative above did not take, everything after this runs on the wrong
+      # interpreter -- including composer, which is a phar invoked through `php`.
+      - name: Verify PHP version and extensions
+        run: |
+          php -r '
+            $wanted = getenv("PHP_VERSION");
+            if (strpos(PHP_VERSION, $wanted . ".") !== 0) {
+              fwrite(STDERR, "Expected PHP {$wanted}.x, got " . PHP_VERSION . PHP_EOL);
+              exit(1);
+            }
+            $required = ["gettext", "mbstring", "curl", "zip", "xml", "gd", "intl", "pdo_mysql", "bcmath"];
+            $loaded = array_map("strtolower", get_loaded_extensions());
+            $missing = array_values(array_diff($required, $loaded));
+            if ($missing) {
+              fwrite(STDERR, "Missing PHP extensions: " . implode(", ", $missing) . PHP_EOL);
+              exit(1);
+            }
+            echo "PHP " . PHP_VERSION . " has all required extensions." . PHP_EOL;
+          '
+          composer --version
+
+      - name: Configure Apache and PHP
+        run: |
+          # Serve the checkout directly. AllowOverride All is what makes the
+          # .htaccess shipped at the repo root effective -- it is the rule that
+          # stops Apache handing out gibbon.sql, config.php's neighbours,
+          # composer.lock and friends.
+          sudo tee /etc/apache2/sites-available/gibbon-demo.conf >/dev/null <<APACHE
+          <VirtualHost *:${PORT}>
+            ServerName localhost
+            DocumentRoot ${GITHUB_WORKSPACE}
+            <Directory ${GITHUB_WORKSPACE}>
+              Options -Indexes +FollowSymLinks
+              AllowOverride All
+              Require all granted
+            </Directory>
+
+            # DirectoryMatch, not <Directory .../.git>: composer installs a
+            # number of packages by cloning, which leaves ~66 more .git
+            # directories under vendor/, and a single path block misses every
+            # one of them. The top-level .git matters most -- with a default
+            # checkout it holds the job's credentials -- but none of these
+            # should be downloadable off a public demo.
+            <DirectoryMatch "/\.git(/|$)">
+              Require all denied
+            </DirectoryMatch>
+            <Directory ${GITHUB_WORKSPACE}/.github>
+              Require all denied
+            </Directory>
+            # The install has already run; re-entering the wizard on a live
+            # instance can only cause confusion.
+            <Directory ${GITHUB_WORKSPACE}/installer>
+              Require all denied
+            </Directory>
+            # Dotfiles (.gitignore, and anything like .env that turns up later).
+            <FilesMatch "^\.">
+              Require all denied
+            </FilesMatch>
+
+            ErrorLog /var/log/apache2/gibbon-error.log
+            CustomLog /var/log/apache2/gibbon-access.log combined
+          </VirtualHost>
+          APACHE
+
+          echo "Listen ${PORT}" | sudo tee /etc/apache2/ports.conf >/dev/null
+          sudo a2dissite 000-default >/dev/null
+          sudo a2ensite gibbon-demo >/dev/null
+          # mod_rewrite is a stated Gibbon requirement; mod_headers backs the
+          # cache-control rules in the root .htaccess.
+          sudo a2enmod rewrite headers >/dev/null
+
+          # The php.ini floors that version.php checks for, plus errors kept
+          # out of the rendered page. Dropped into both SAPIs -- the apache2 one
+          # serves the site, the cli one runs the installer -- and the target
+          # directories are globbed so the exact path does not have to be
+          # spelled out per PHP version.
+          printf '%s\n' \
+            'max_input_vars = 8000' \
+            'max_file_uploads = 20' \
+            'allow_url_fopen = On' \
+            'session.gc_maxlifetime = 1440' \
+            'post_max_size = 64M' \
+            'upload_max_filesize = 64M' \
+            'memory_limit = 512M' \
+            'display_errors = Off' \
+            'date.timezone = UTC' \
+            > /tmp/99-gibbon.ini
+          # An unmatched glob stays literal and the [ -d ] simply fails, so
+          # this loop can quietly copy nothing at all -- leaving max_input_vars
+          # at the default 1000 against the required 8000, which shows up much
+          # later as large Gibbon forms silently truncating their POST. Count
+          # the copies and refuse to continue at zero.
+          installed=0
+          for dir in /etc/php/*/apache2/conf.d /etc/php/*/cli/conf.d; do
+            if [ -d "$dir" ]; then
+              sudo cp /tmp/99-gibbon.ini "$dir/99-gibbon.ini"
+              echo "  wrote $dir/99-gibbon.ini"
+              installed=$((installed + 1))
+            fi
+          done
+          if [ "$installed" -eq 0 ]; then
+            echo "::error::No PHP conf.d directory found; the php.ini overrides were not applied."
+            exit 1
+          fi
+          # Assert both SAPIs really picked them up, rather than trusting the copy.
+          grep -q 'max_input_vars = 8000' /etc/php/*/apache2/conf.d/99-gibbon.ini
+          php -r 'if ((int) ini_get("max_input_vars") < 8000) { fwrite(STDERR, "CLI max_input_vars is " . ini_get("max_input_vars") . PHP_EOL); exit(1); }'
+
+          sudo apache2ctl configtest
+
+      - name: Cache Composer downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/composer
+          key: composer-${{ hashFiles('composer.lock') }}
+          restore-keys: composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-dev --no-interaction --no-progress --prefer-dist --optimize-autoloader
+
+      # A fresh password per run, so an old run's summary is never a way back
+      # into a later one. Shaped to satisfy a conventional password policy and
+      # still be typable.
+      - name: Generate demo credentials
+        run: echo "GIBBON_DEMO_PASSWORD=Demo-$(openssl rand -hex 4)!" >> "$GITHUB_ENV"
+
+      # Into RUNNER_TEMP, not the working directory: run steps start in
+      # ${GITHUB_WORKSPACE}, which is about to become the DocumentRoot, and
+      # ".deb" is not on the extension list the repo's .htaccess denies -- so a
+      # plain `-o cloudflared.deb` publishes a 19MB download off the demo.
+      # -f so an error page from the CDN fails here rather than surfacing later
+      # as "dpkg-deb: not a Debian format archive".
+      - name: Install cloudflared
+        run: |
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o "${RUNNER_TEMP}/cloudflared.deb" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "${RUNNER_TEMP}/cloudflared.deb"
+          cloudflared --version
+
+      # The tunnel comes up before the app does, on purpose. Gibbon bakes its
+      # public hostname into every rendered link, asset src and htmx endpoint
+      # (absoluteURL, read out of gibbonSetting into the session), so the
+      # hostname has to be known *before* the install writes that setting.
+      # A quick tunnel serves 502s until the origin answers, and the link is
+      # only published once the site is actually up.
+      - name: Start Cloudflare tunnel
+        id: tunnel
+        run: |
+          nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" > /tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+
+          # cloudflared provisions a quick tunnel by calling
+          # https://api.trycloudflare.com, and its failure messages quote that
+          # URL -- which the obvious regex matches just as happily as a real
+          # tunnel hostname. Scraping it would bake Cloudflare's API endpoint
+          # into Gibbon's absoluteURL and produce a green job pointing at a
+          # dead link, so the API host is excluded explicitly. (Observed: a
+          # blocked provisioning call logs "Host not in allowlist:
+          # api.trycloudflare.com".)
+          URL=""
+          for i in $(seq 1 30); do
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "cloudflared exited before a tunnel was established:"
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+            URL=$(grep -oE 'https://[A-Za-z0-9][A-Za-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log \
+                  | grep -v '^https://api\.' | head -1 || true)
+            [ -n "$URL" ] && break
+            sleep 2
+          done
+          if [ -z "$URL" ]; then
+            echo "Failed to get a tunnel URL, cloudflared log:"
+            cat /tmp/cloudflared.log
+            exit 1
+          fi
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Tunnel URL: $URL"
+
+      # Drives the same Gibbon\Install\Installer API the web wizard uses; see
+      # the header of the script. The tunnel URL arrives through env rather
+      # than being interpolated into the shell, same rule as the dispatch
+      # inputs below.
+      #
+      # The exit code is deliberately not the gate. gibbon.php registers a
+      # shutdown function ending in a bare `exit;`, which rewrites the process
+      # status to 0 -- so once it has been included, a failed install still
+      # exits clean. The script prints GIBBON_DEMO_INSTALL_OK as its last line
+      # only on success; that is what decides this step.
+      - name: Install Gibbon
+        env:
+          GIBBON_ABSOLUTE_URL: ${{ steps.tunnel.outputs.url }}
+          GIBBON_DEMO_DATA: ${{ inputs.demo_data }}
+        run: |
+          php .github/scripts/install-demo.php 2>&1 | tee /tmp/gibbon-install.log
+          if ! grep -q 'GIBBON_DEMO_INSTALL_OK' /tmp/gibbon-install.log; then
+            echo "::error::Gibbon install did not complete. See the log above."
+            exit 1
+          fi
+
+      - name: Start Apache
+        run: |
+          # Apache runs as www-data, which owns none of this. It needs to read
+          # the checkout, traverse every directory above it, and write into
+          # uploads/ (attachments, and the compiled Twig templates Gibbon puts
+          # in uploads/cache). Walking the ancestors explicitly rather than
+          # trusting the runner's home directory to be world-executable: when it
+          # is not, every request 403s with "search permissions are missing on a
+          # component of the path" and nothing else explains why.
+          sudo chmod -R a+rX "${GITHUB_WORKSPACE}"
+          # pwd -P first: dirname walks a path lexically, so a symlinked
+          # ancestor would have the loop chmod the wrong chain. The "." guard
+          # stops a relative path (dirname "foo" is ".", and dirname "." is "."
+          # forever) turning this into a spin until the job timeout.
+          dir=$(cd "${GITHUB_WORKSPACE}" && pwd -P)
+          while [ "$dir" != "/" ] && [ "$dir" != "." ]; do
+            sudo chmod o+x "$dir"
+            dir=$(dirname "$dir")
+          done
+          sudo mkdir -p "${GITHUB_WORKSPACE}/uploads/cache"
+          sudo chown -R www-data:www-data "${GITHUB_WORKSPACE}/uploads"
+
+          # Diagnostics on a failed start, rather than letting errexit end the
+          # step before the one log that would explain it.
+          sudo systemctl start apache2 || {
+            sudo journalctl -u apache2 --no-pager -n 50 || true
+            sudo tail -n 50 /var/log/apache2/gibbon-error.log || true
+            exit 1
+          }
+
+          # "Apache answered" is not "Gibbon works". error.php sets no status
+          # code, so a failed database connection or a missing academic year
+          # renders as a plain HTTP 200 error page, and an uninstalled Gibbon
+          # 302s to the web installer -- curl -sf accepts both. So require a
+          # 200 whose body carries the login form.
+          for i in $(seq 1 45); do
+            CODE=$(curl -s -o /tmp/probe.html -w '%{http_code}' "http://127.0.0.1:${PORT}/") || CODE=000
+            if [ "$CODE" = "200" ] && grep -q 'id="loginForm"' /tmp/probe.html; then
+              echo "Gibbon is serving the login page on 127.0.0.1:${PORT}"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Gibbon did not come up (last status ${CODE}). Page it served:"
+          head -c 2000 /tmp/probe.html || true
+          echo
+          echo "Apache error log:"
+          sudo tail -n 50 /var/log/apache2/gibbon-error.log || true
+          exit 1
+
+      # Fatal, unlike the origin check being merely advisory: if this cannot
+      # get the login page through the tunnel, the only thing this workflow
+      # produces is a link that does not work, and publishing that is worse
+      # than failing. `CODE=$(...) || CODE=000` rather than `$(... || echo 000)`
+      # because the latter concatenates curl's output with the fallback when
+      # curl writes a status and *then* exits non-zero (a --max-time abort
+      # mid-transfer), yielding a two-line "200\n000" that never compares equal.
+      - name: Check the tunnel reaches it
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+        run: |
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /tmp/tunnel-probe.html -w '%{http_code}' --max-time 30 "$TUNNEL_URL/") || CODE=000
+            if [ "$CODE" = "200" ] && grep -q 'id="loginForm"' /tmp/tunnel-probe.html; then
+              echo "Tunnel is serving the login page."
+              exit 0
+            fi
+            echo "Tunnel returned HTTP ${CODE}, retrying..."
+            sleep 5
+          done
+          echo "::error::The tunnel never served the login page (last status ${CODE})."
+          head -c 1000 /tmp/tunnel-probe.html || true
+          exit 1
+
+      - name: Publish the link
+        env:
+          # Passed through env rather than interpolated directly into the
+          # script (never trust a workflow_dispatch input enough to splice
+          # it straight into shell source -- see
+          # https://securitylab.github.com/research/github-actions-untrusted-input/).
+          DURATION_MINUTES_INPUT: ${{ inputs.duration_minutes }}
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+        run: |
+          # The link goes to the log first: everything below it can fail, and
+          # a run that brought a demo up but printed the link nowhere is the
+          # one outcome with no recovery.
+          echo "LIVE LINK: $TUNNEL_URL"
+          echo "Sign in as ${GIBBON_ADMIN_USERNAME} / ${GIBBON_DEMO_PASSWORD}"
+
+          MINUTES="$DURATION_MINUTES_INPUT"
+          case "$MINUTES" in
+            ''|*[!0-9]*) MINUTES=60 ;;
+          esac
+          # 10# forces base 10. $(( )) reads a leading zero as octal, so "060"
+          # would quietly become 48 minutes and "080" would abort the keep-alive
+          # step outright with "value too great for base" -- tearing down a demo
+          # that had just been published. `test -lt` does not do this, so the
+          # clamps below would not have caught either one.
+          MINUTES=$((10#$MINUTES))
+          [ "$MINUTES" -lt 1 ] && MINUTES=1
+          [ "$MINUTES" -gt 300 ] && MINUTES=300
+          echo "DEMO_MINUTES=$MINUTES" >> "$GITHUB_ENV"
+
+          {
+            echo "## Live link"
+            echo ""
+            echo "$TUNNEL_URL"
+            echo ""
+            if [ -s "$GIBBON_SUMMARY_FILE" ]; then
+              cat "$GIBBON_SUMMARY_FILE"
+            else
+              echo "_(login table unavailable -- see the install step's log)_"
+            fi
+            echo ""
+            echo "Stays up for $MINUTES minute(s), or until you cancel this run from the Actions tab (top right of this run's page -> Cancel workflow)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Keep alive (cancel this run any time to end the preview)
+        run: |
+          # This trap tidies up on normal expiry. It is not what makes
+          # cancelling work -- cancelling destroys the runner, and with it the
+          # tunnel, whether or not anything here gets to run first.
+          cleanup() {
+            echo "Ending preview: stopping the tunnel and server..."
+            pkill -f 'cloudflared tunnel' 2>/dev/null || true
+            sudo systemctl stop apache2 2>/dev/null || true
+          }
+          trap cleanup EXIT INT TERM
+
+          echo "Live link stays up for ${DEMO_MINUTES} minute(s), or until you cancel this run from the Actions tab (top right of this run's page -> Cancel workflow)."
+
+          # `sleep & wait` so a signal is handled promptly instead of after the
+          # full sleep; `|| true` because wait reports 128+N when the sleep is
+          # signalled, which would otherwise mark a deliberate cancellation as
+          # a failed job.
+          sleep "$((DEMO_MINUTES * 60))" &
+          wait $! || true
