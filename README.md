@@ -9,6 +9,7 @@
 Gibbon Core
 ===========
 The Core repository represents the bulk of Gibbon, including all of its primary functionality. The core can be extended through the use of modules and themes, which are provided separately. See the [Extend](https://gibbonedu.org/extend/) page for more info.
+Also you can now run this through Actions at the top for a quick and easy way to run a disposable version of this.
 
 Gibbon is open source, and maintained for the benefit of teachers, students, parents and schools.
 
