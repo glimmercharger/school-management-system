@@ -15,14 +15,50 @@ Actions tab → **Live demo** → **Run workflow**. Two inputs:
 | `demo_data` | `true` | Load `gibbon_demo.sql` — a whole demo school (≈1,200 people, classes, timetables). Untick for an empty install. |
 
 Takes roughly 4–6 minutes to come up. When it is ready, the run's **summary**
-page shows the `https://<random>.trycloudflare.com` link and a table of logins —
-an administrator plus one real teacher, student and parent from the demo data,
-all sharing a password generated fresh for that run.
+page shows the `https://<random>.trycloudflare.com` link and the logins.
 
 Starting a new run cancels any run already in progress (`concurrency:
 cancel-in-progress`), so **re-running the workflow is how you get a new link**.
-To end a demo early, open the run and hit *Cancel workflow*; the keep-alive step
-traps that and shuts the tunnel down.
+To end a demo early, open the run and hit *Cancel workflow* — that destroys the
+runner, and the tunnel with it.
+
+## Signing in
+
+**The password is generated fresh for every run and printed in that run's
+summary** — there is no fixed one to memorise here, and an old run's password is
+no use against a later run. It looks like `Demo-3f9c1a2e!`.
+
+**Every account that can log in shares that one password.** That is deliberate:
+Gibbon looks completely different to a parent than it does to an administrator,
+and the point of the demo is to be able to see both. It is only acceptable
+because the database is thrown away when the job ends.
+
+| Account | Username | Exists when |
+| --- | --- | --- |
+| Administrator (created by the installer) | `admin` | always |
+| Everyone in the demo school | a numeric ID, e.g. `1117` | `demo_data` is on |
+
+With `demo_data` on you get 1,178 usable accounts:
+
+| Role | Accounts | Example from the demo data |
+| --- | --- | --- |
+| Parent | 704 | `2747` — Leonard Abbott |
+| Student | 414 | `2746` — Reese Abbott |
+| Teacher | 47 | `1117` — Camille Ballard |
+| Administrator | 9 | `192` — Buffy Ellison |
+| Support Staff | 4 | — |
+
+The run summary picks one real teacher, student and parent out of the database
+and lists them with the password, so you can go straight from the summary to
+signing in as each role. The examples above are what it currently picks; trust
+the summary over this table.
+
+Demo usernames are numeric staff/student IDs rather than names — `1117`, not
+`camille.ballard`. To find others, sign in as `admin` and go to **User Admin →
+Manage Users**, which lists everyone with their username.
+
+With `demo_data` off, `admin` is the only account that exists and the school is
+empty.
 
 ## How it works
 
@@ -60,9 +96,6 @@ step it replaces.
   everything works, but once today falls outside that range, views scoped to
   *today* (timetable, attendance, daily dashboard widgets) come up empty. The run
   summary says so explicitly when it applies.
-- **Every account that can log in shares one password.** That is the point — you
-  can look around as a parent or a student, not just as an admin — and it is only
-  acceptable because the database is destroyed with the job.
 - **Nothing phones home.** `statsCollection`, `registerGibbonSupport` and
   `cuttingEdgeCode` are all forced off, so the instance never registers itself
   with gibbonedu.org or tries to update itself.
