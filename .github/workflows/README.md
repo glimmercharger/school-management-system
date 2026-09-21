@@ -66,6 +66,13 @@ step it replaces.
 - **Nothing phones home.** `statsCollection`, `registerGibbonSupport` and
   `cuttingEdgeCode` are all forced off, so the instance never registers itself
   with gibbonedu.org or tries to update itself.
+- **A broken demo fails the run rather than publishing a link.** Gibbon's error
+  page is served with HTTP 200, so "the server answered" proves nothing; both
+  readiness gates require a 200 whose body actually contains the login form,
+  once against the origin and once back through the tunnel.
 - **The link is public.** Anyone who has it can use the instance for as long as
   the run lasts. Treat it as a disposable sandbox, never as somewhere to put real
-  data.
+  data. The vhost keeps `.git` (including the ~66 copies composer leaves under
+  `vendor/`), `.github`, `installer/` and dotfiles off it, and the checkout runs
+  with `persist-credentials: false` so the job's token is never written to disk
+  inside the document root.

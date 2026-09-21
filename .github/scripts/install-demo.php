@@ -336,7 +336,13 @@ function install_gibbon_demo($container, $session, array $demo): void
         );
     }
 
-    file_put_contents($demo['summaryFile'], implode("\n", $lines) . "\n");
+    // Fail rather than print the sentinel: the workflow reads this file to build
+    // the run summary, and an install that "succeeded" without producing the
+    // credentials is not a usable demo.
+    if (file_put_contents($demo['summaryFile'], implode("\n", $lines) . "\n") === false) {
+        fwrite(STDERR, "Could not write the login summary to {$demo['summaryFile']}.\n");
+        exit(1);
+    }
     demo_step('Install complete: ' . DEMO_INSTALL_SENTINEL);
 }
 

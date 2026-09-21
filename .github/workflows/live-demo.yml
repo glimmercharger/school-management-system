@@ -134,12 +134,15 @@ jobs:
               Require all granted
             </Directory>
 
-            # None of this is part of the running app, and .git would otherwise
-            # hand out the repository's history -- and, with a default checkout,
-            # the job's credentials.
-            <Directory ${GITHUB_WORKSPACE}/.git>
+            # DirectoryMatch, not <Directory .../.git>: composer installs a
+            # number of packages by cloning, which leaves ~66 more .git
+            # directories under vendor/, and a single path block misses every
+            # one of them. The top-level .git matters most -- with a default
+            # checkout it holds the job's credentials -- but none of these
+            # should be downloadable off a public demo.
+            <DirectoryMatch "/\.git(/|$)">
               Require all denied
-            </Directory>
+            </DirectoryMatch>
             <Directory ${GITHUB_WORKSPACE}/.github>
               Require all denied
             </Directory>
@@ -181,9 +184,27 @@ jobs:
             'display_errors = Off' \
             'date.timezone = UTC' \
             > /tmp/99-gibbon.ini
+          # An unmatched glob stays literal and the [ -d ] simply fails, so
+          # this loop can quietly copy nothing at all -- leaving max_input_vars
+          # at the default 1000 against the required 8000, which shows up much
+          # later as large Gibbon forms silently truncating their POST. Count
+          # the copies and refuse to continue at zero.
+          installed=0
           for dir in /etc/php/*/apache2/conf.d /etc/php/*/cli/conf.d; do
-            [ -d "$dir" ] && sudo cp /tmp/99-gibbon.ini "$dir/99-gibbon.ini"
+            if [ -d "$dir" ]; then
+              sudo cp /tmp/99-gibbon.ini "$dir/99-gibbon.ini"
+              echo "  wrote $dir/99-gibbon.ini"
+              installed=$((installed + 1))
+            fi
           done
+          if [ "$installed" -eq 0 ]; then
+            echo "::error::No PHP conf.d directory found; the php.ini overrides were not applied."
+            exit 1
+          fi
+          # Assert both SAPIs really picked them up, rather than trusting the copy.
+          grep -q 'max_input_vars = 8000' /etc/php/*/apache2/conf.d/99-gibbon.ini
+          php -r 'if ((int) ini_get("max_input_vars") < 8000) { fwrite(STDERR, "CLI max_input_vars is " . ini_get("max_input_vars") . PHP_EOL); exit(1); }'
+
           sudo apache2ctl configtest
 
       - name: Cache Composer downloads
@@ -202,10 +223,19 @@ jobs:
       - name: Generate demo credentials
         run: echo "GIBBON_DEMO_PASSWORD=Demo-$(openssl rand -hex 4)!" >> "$GITHUB_ENV"
 
+      # Into RUNNER_TEMP, not the working directory: run steps start in
+      # ${GITHUB_WORKSPACE}, which is about to become the DocumentRoot, and
+      # ".deb" is not on the extension list the repo's .htaccess denies -- so a
+      # plain `-o cloudflared.deb` publishes a 19MB download off the demo.
+      # -f so an error page from the CDN fails here rather than surfacing later
+      # as "dpkg-deb: not a Debian format archive".
       - name: Install cloudflared
         run: |
-          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
-          sudo dpkg -i cloudflared.deb
+          curl -fsSL --retry 3 --retry-all-errors \
+            -o "${RUNNER_TEMP}/cloudflared.deb" \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i "${RUNNER_TEMP}/cloudflared.deb"
+          cloudflared --version
 
       # The tunnel comes up before the app does, on purpose. Gibbon bakes its
       # public hostname into every rendered link, asset src and htmx endpoint
@@ -217,9 +247,25 @@ jobs:
         id: tunnel
         run: |
           nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:${PORT}" > /tmp/cloudflared.log 2>&1 &
+          CLOUDFLARED_PID=$!
+
+          # cloudflared provisions a quick tunnel by calling
+          # https://api.trycloudflare.com, and its failure messages quote that
+          # URL -- which the obvious regex matches just as happily as a real
+          # tunnel hostname. Scraping it would bake Cloudflare's API endpoint
+          # into Gibbon's absoluteURL and produce a green job pointing at a
+          # dead link, so the API host is excluded explicitly. (Observed: a
+          # blocked provisioning call logs "Host not in allowlist:
+          # api.trycloudflare.com".)
           URL=""
           for i in $(seq 1 30); do
-            URL=$(grep -oE 'https://[A-Za-z0-9][A-Za-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log | head -1 || true)
+            if ! kill -0 "$CLOUDFLARED_PID" 2>/dev/null; then
+              echo "cloudflared exited before a tunnel was established:"
+              cat /tmp/cloudflared.log
+              exit 1
+            fi
+            URL=$(grep -oE 'https://[A-Za-z0-9][A-Za-z0-9-]*\.trycloudflare\.com' /tmp/cloudflared.log \
+                  | grep -v '^https://api\.' | head -1 || true)
             [ -n "$URL" ] && break
             sleep 2
           done
@@ -262,42 +308,69 @@ jobs:
           # is not, every request 403s with "search permissions are missing on a
           # component of the path" and nothing else explains why.
           sudo chmod -R a+rX "${GITHUB_WORKSPACE}"
-          dir="${GITHUB_WORKSPACE}"
-          while [ "$dir" != "/" ]; do
+          # pwd -P first: dirname walks a path lexically, so a symlinked
+          # ancestor would have the loop chmod the wrong chain. The "." guard
+          # stops a relative path (dirname "foo" is ".", and dirname "." is "."
+          # forever) turning this into a spin until the job timeout.
+          dir=$(cd "${GITHUB_WORKSPACE}" && pwd -P)
+          while [ "$dir" != "/" ] && [ "$dir" != "." ]; do
             sudo chmod o+x "$dir"
             dir=$(dirname "$dir")
           done
           sudo mkdir -p "${GITHUB_WORKSPACE}/uploads/cache"
           sudo chown -R www-data:www-data "${GITHUB_WORKSPACE}/uploads"
-          sudo systemctl start apache2
 
+          # Diagnostics on a failed start, rather than letting errexit end the
+          # step before the one log that would explain it.
+          sudo systemctl start apache2 || {
+            sudo journalctl -u apache2 --no-pager -n 50 || true
+            sudo tail -n 50 /var/log/apache2/gibbon-error.log || true
+            exit 1
+          }
+
+          # "Apache answered" is not "Gibbon works". error.php sets no status
+          # code, so a failed database connection or a missing academic year
+          # renders as a plain HTTP 200 error page, and an uninstalled Gibbon
+          # 302s to the web installer -- curl -sf accepts both. So require a
+          # 200 whose body carries the login form.
           for i in $(seq 1 45); do
-            if curl -sf -o /dev/null "http://127.0.0.1:${PORT}/"; then
-              echo "Gibbon is serving on 127.0.0.1:${PORT}"
+            CODE=$(curl -s -o /tmp/probe.html -w '%{http_code}' "http://127.0.0.1:${PORT}/") || CODE=000
+            if [ "$CODE" = "200" ] && grep -q 'id="loginForm"' /tmp/probe.html; then
+              echo "Gibbon is serving the login page on 127.0.0.1:${PORT}"
               exit 0
             fi
             sleep 2
           done
-          echo "Gibbon did not come up. Apache error log:"
+          echo "Gibbon did not come up (last status ${CODE}). Page it served:"
+          head -c 2000 /tmp/probe.html || true
+          echo
+          echo "Apache error log:"
           sudo tail -n 50 /var/log/apache2/gibbon-error.log || true
           exit 1
 
+      # Fatal, unlike the origin check being merely advisory: if this cannot
+      # get the login page through the tunnel, the only thing this workflow
+      # produces is a link that does not work, and publishing that is worse
+      # than failing. `CODE=$(...) || CODE=000` rather than `$(... || echo 000)`
+      # because the latter concatenates curl's output with the fallback when
+      # curl writes a status and *then* exits non-zero (a --max-time abort
+      # mid-transfer), yielding a two-line "200\n000" that never compares equal.
       - name: Check the tunnel reaches it
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
-          for i in $(seq 1 15); do
-            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$TUNNEL_URL/" || echo 000)
-            if [ "$CODE" = "200" ]; then
-              echo "Tunnel is serving the login page (HTTP 200)."
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /tmp/tunnel-probe.html -w '%{http_code}' --max-time 30 "$TUNNEL_URL/") || CODE=000
+            if [ "$CODE" = "200" ] && grep -q 'id="loginForm"' /tmp/tunnel-probe.html; then
+              echo "Tunnel is serving the login page."
               exit 0
             fi
-            echo "Tunnel returned HTTP $CODE, retrying..."
-            sleep 4
+            echo "Tunnel returned HTTP ${CODE}, retrying..."
+            sleep 5
           done
-          # Non-fatal: the origin is verified healthy above, and the keep-alive
-          # step still gives the operator a link to try.
-          echo "::warning::Could not confirm a 200 through the tunnel; the link may need a few more seconds."
+          echo "::error::The tunnel never served the login page (last status ${CODE})."
+          head -c 1000 /tmp/tunnel-probe.html || true
+          exit 1
 
       - name: Publish the link
         env:
@@ -308,10 +381,22 @@ jobs:
           DURATION_MINUTES_INPUT: ${{ inputs.duration_minutes }}
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
+          # The link goes to the log first: everything below it can fail, and
+          # a run that brought a demo up but printed the link nowhere is the
+          # one outcome with no recovery.
+          echo "LIVE LINK: $TUNNEL_URL"
+          echo "Sign in as ${GIBBON_ADMIN_USERNAME} / ${GIBBON_DEMO_PASSWORD}"
+
           MINUTES="$DURATION_MINUTES_INPUT"
           case "$MINUTES" in
             ''|*[!0-9]*) MINUTES=60 ;;
           esac
+          # 10# forces base 10. $(( )) reads a leading zero as octal, so "060"
+          # would quietly become 48 minutes and "080" would abort the keep-alive
+          # step outright with "value too great for base" -- tearing down a demo
+          # that had just been published. `test -lt` does not do this, so the
+          # clamps below would not have caught either one.
+          MINUTES=$((10#$MINUTES))
           [ "$MINUTES" -lt 1 ] && MINUTES=1
           [ "$MINUTES" -gt 300 ] && MINUTES=300
           echo "DEMO_MINUTES=$MINUTES" >> "$GITHUB_ENV"
@@ -321,16 +406,20 @@ jobs:
             echo ""
             echo "$TUNNEL_URL"
             echo ""
-            cat "$GIBBON_SUMMARY_FILE"
+            if [ -s "$GIBBON_SUMMARY_FILE" ]; then
+              cat "$GIBBON_SUMMARY_FILE"
+            else
+              echo "_(login table unavailable -- see the install step's log)_"
+            fi
             echo ""
             echo "Stays up for $MINUTES minute(s), or until you cancel this run from the Actions tab (top right of this run's page -> Cancel workflow)."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "LIVE LINK: $TUNNEL_URL"
-          echo "Sign in as ${GIBBON_ADMIN_USERNAME} / ${GIBBON_DEMO_PASSWORD}"
-
       - name: Keep alive (cancel this run any time to end the preview)
         run: |
+          # This trap tidies up on normal expiry. It is not what makes
+          # cancelling work -- cancelling destroys the runner, and with it the
+          # tunnel, whether or not anything here gets to run first.
           cleanup() {
             echo "Ending preview: stopping the tunnel and server..."
             pkill -f 'cloudflared tunnel' 2>/dev/null || true
@@ -340,5 +429,9 @@ jobs:
 
           echo "Live link stays up for ${DEMO_MINUTES} minute(s), or until you cancel this run from the Actions tab (top right of this run's page -> Cancel workflow)."
 
+          # `sleep & wait` so a signal is handled promptly instead of after the
+          # full sleep; `|| true` because wait reports 128+N when the sleep is
+          # signalled, which would otherwise mark a deliberate cancellation as
+          # a failed job.
           sleep "$((DEMO_MINUTES * 60))" &
-          wait $!
+          wait $! || true
