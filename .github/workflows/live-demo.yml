@@ -59,6 +59,7 @@ jobs:
       GIBBON_ADMIN_EMAIL: admin@example.invalid
       GIBBON_TIMEZONE: UTC
       GIBBON_SUMMARY_FILE: /tmp/gibbon-logins.md
+      GIBBON_LOGINS_FILE: /tmp/gibbon-logins.txt
     steps:
       # persist-credentials: false because the checkout lands inside a document
       # root that is about to be published. With the default (true),
@@ -381,11 +382,31 @@ jobs:
           DURATION_MINUTES_INPUT: ${{ inputs.duration_minutes }}
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
-          # The link goes to the log first: everything below it can fail, and
-          # a run that brought a demo up but printed the link nowhere is the
-          # one outcome with no recovery.
-          echo "LIVE LINK: $TUNNEL_URL"
-          echo "Sign in as ${GIBBON_ADMIN_USERNAME} / ${GIBBON_DEMO_PASSWORD}"
+          # The log first, and loudly. Everything below this can fail, and a
+          # run that brought a demo up but printed the link nowhere is the one
+          # outcome with no recovery -- and most people read the job log, not
+          # the summary page, so the credentials have to be legible here too.
+          RULE="============================================================"
+          echo "$RULE"
+          echo "  LIVE DEMO IS UP"
+          echo "$RULE"
+          echo
+          echo "  $TUNNEL_URL"
+          echo
+          if [ -s "$GIBBON_LOGINS_FILE" ]; then
+            sed 's/^/  /' "$GIBBON_LOGINS_FILE"
+          else
+            echo "  ADMIN LOGIN"
+            echo "      username:  ${GIBBON_ADMIN_USERNAME}"
+            echo "      password:  ${GIBBON_DEMO_PASSWORD}"
+          fi
+          echo
+          echo "$RULE"
+
+          # A notice annotation as well: these surface at the top of the run
+          # page, so the link and admin login are visible without opening the
+          # log or the summary at all.
+          echo "::notice title=Live demo ready::${TUNNEL_URL} -- sign in as ${GIBBON_ADMIN_USERNAME} / ${GIBBON_DEMO_PASSWORD}"
 
           MINUTES="$DURATION_MINUTES_INPUT"
           case "$MINUTES" in
@@ -405,6 +426,8 @@ jobs:
             echo "## Live link"
             echo ""
             echo "$TUNNEL_URL"
+            echo ""
+            echo "Sign in as **\`${GIBBON_ADMIN_USERNAME}\`** / **\`${GIBBON_DEMO_PASSWORD}\`**."
             echo ""
             if [ -s "$GIBBON_SUMMARY_FILE" ]; then
               cat "$GIBBON_SUMMARY_FILE"

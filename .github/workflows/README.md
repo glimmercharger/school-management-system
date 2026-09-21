@@ -24,9 +24,14 @@ runner, and the tunnel with it.
 
 ## Signing in
 
-**The password is generated fresh for every run and printed in that run's
-summary** — there is no fixed one to memorise here, and an old run's password is
-no use against a later run. It looks like `Demo-3f9c1a2e!`.
+**The password is generated fresh for every run** — there is no fixed one to
+memorise here, and an old run's password is no use against a later run. It looks
+like `Demo-3f9c1a2e!`. The run tells you it in three places, so you should not
+have to hunt:
+
+- a **notice at the top of the run page**, with the link and the admin login;
+- a banner in the **job log**, at the end of the "Publish the link" step;
+- the full table on the run's **summary** page.
 
 **Every account that can log in shares that one password.** That is deliberate:
 Gibbon looks completely different to a parent than it does to an administrator,

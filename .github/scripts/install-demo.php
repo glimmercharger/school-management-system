@@ -85,6 +85,7 @@ $demo = [
     'orgNameShort'  => demo_env('GIBBON_ORG_NAME_SHORT', 'GDS'),
     'country'       => demo_env('GIBBON_COUNTRY', 'United Kingdom'),
     'summaryFile'   => demo_env('GIBBON_SUMMARY_FILE'),
+    'loginsFile'    => demo_env('GIBBON_LOGINS_FILE'),
 ];
 
 // The URL ends up in every rendered link, asset src and htmx endpoint, so a
@@ -286,17 +287,9 @@ function install_gibbon_demo($container, $session, array $demo): void
         demo_step("Note: today ({$today}) is outside that range, so date-scoped views will be empty");
     }
 
-    if ($demo['summaryFile'] === '') {
-        demo_step('Install complete: ' . DEMO_INSTALL_SENTINEL);
-        return;
-    }
-
-    // One real login per role, for the run summary.
-    $lines = [
-        '| Role | Username | Password |',
-        '| --- | --- | --- |',
-        sprintf('| Administrator | `%s` | `%s` |', $demo['adminUsername'], $demo['password']),
-    ];
+    // Collect one real login per role. The administrator is always first: it is
+    // the account someone reaching for "just let me in" wants.
+    $logins = [['Administrator', $demo['adminUsername'], 'Admin Demo']];
     if ($demo['demoData']) {
         foreach (['002' => 'Teacher', '003' => 'Student', '004' => 'Parent'] as $roleID => $roleName) {
             $sample = $pdo->prepare(
@@ -307,42 +300,69 @@ function install_gibbon_demo($container, $session, array $demo): void
             );
             $sample->execute([':roleID' => $roleID]);
             if ($row = $sample->fetch(\PDO::FETCH_ASSOC)) {
-                $lines[] = sprintf(
-                    '| %s (%s %s) | `%s` | `%s` |',
-                    $roleName,
-                    $row['preferredName'],
-                    $row['surname'],
-                    $row['username'],
-                    $demo['password']
-                );
+                $logins[] = [$roleName, $row['username'], $row['preferredName'] . ' ' . $row['surname']];
             }
         }
     }
-    $lines[] = '';
-    $lines[] = sprintf(
-        'Academic year: **%s** (%s to %s). Demo data: **%s**.',
+
+    $yearNote = sprintf(
+        'Academic year: %s (%s to %s). Demo data: %s.',
         $year['name'],
         $year['firstDay'],
         $year['lastDay'],
         $demo['demoData'] ? 'loaded' : 'not loaded'
     );
-    if ($yearIsStale) {
-        $lines[] = '';
-        $lines[] = sprintf(
+    $staleNote = $yearIsStale
+        ? sprintf(
             'Today (%s) falls outside that year, which is as far as the bundled demo data goes. '
-            . 'Everything works, but views scoped to *today* -- timetable, attendance, the daily '
+            . 'Everything works, but views scoped to today -- timetable, attendance, the daily '
             . 'dashboard widgets -- will be empty. Use the year switcher or browse by date to see data.',
             $today
-        );
+        )
+        : '';
+
+    // Markdown, for the run summary page.
+    if ($demo['summaryFile'] !== '') {
+        $md = ['| Role | Username | Password |', '| --- | --- | --- |'];
+        foreach ($logins as [$roleName, $username, $fullName]) {
+            $md[] = $roleName === 'Administrator'
+                ? sprintf('| **Administrator** | `%s` | `%s` |', $username, $demo['password'])
+                : sprintf('| %s (%s) | `%s` | `%s` |', $roleName, $fullName, $username, $demo['password']);
+        }
+        $md[] = '';
+        $md[] = $yearNote;
+        if ($staleNote !== '') {
+            $md[] = '';
+            $md[] = $staleNote;
+        }
+        // Fail rather than print the sentinel: an install that "succeeded"
+        // without producing the credentials is not a usable demo.
+        if (file_put_contents($demo['summaryFile'], implode("\n", $md) . "\n") === false) {
+            fwrite(STDERR, "Could not write the login summary to {$demo['summaryFile']}.\n");
+            exit(1);
+        }
     }
 
-    // Fail rather than print the sentinel: the workflow reads this file to build
-    // the run summary, and an install that "succeeded" without producing the
-    // credentials is not a usable demo.
-    if (file_put_contents($demo['summaryFile'], implode("\n", $lines) . "\n") === false) {
-        fwrite(STDERR, "Could not write the login summary to {$demo['summaryFile']}.\n");
-        exit(1);
+    // Plain text, for the job log -- where people actually look first, and where
+    // a markdown table is harder to read than a plain list.
+    if ($demo['loginsFile'] !== '') {
+        $txt = [];
+        $txt[] = 'ADMIN LOGIN';
+        $txt[] = sprintf('    username:  %s', $demo['adminUsername']);
+        $txt[] = sprintf('    password:  %s', $demo['password']);
+        if (count($logins) > 1) {
+            $txt[] = '';
+            $txt[] = 'OTHER ROLES (same password as above)';
+            foreach (array_slice($logins, 1) as [$roleName, $username, $fullName]) {
+                $txt[] = sprintf('    %-9s username: %-8s (%s)', $roleName, $username, $fullName);
+            }
+        }
+        if (file_put_contents($demo['loginsFile'], implode("\n", $txt) . "\n") === false) {
+            fwrite(STDERR, "Could not write the login list to {$demo['loginsFile']}.\n");
+            exit(1);
+        }
     }
+
     demo_step('Install complete: ' . DEMO_INSTALL_SENTINEL);
 }
 
